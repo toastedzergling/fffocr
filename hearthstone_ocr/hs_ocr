@@ -1,0 +1,190 @@
+#!/usr/bin/perl 
+
+#   Copyright 2013, Jonas L (Hid/ImHid on twitch.tv)
+#
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+use Modern::Perl '2013'; # sets strict/warnings and enables perl 5.16 features, remove the '2013' part if you're running a perl version older than this.
+use Image::Magick;
+
+# what FPS to run the parser at. twitch streams run at 30 fps, but we really don't need to look at more than 2-5 frames per second to get reliable
+# matches, it just wastes resources if we do so.
+my $fps = 5;
+
+# Path to tesseract binary
+my $cmd = "/usr/bin/tesseract";
+# temporary image location (saved for tesseract to read)
+my $img_out = "/tmp/ocr/analyze.jpg"; # somewhat important for performance that this file is on an ssd or ram drive
+
+# Named pipe we write to for hidbot to read the stats. Prefered form of IPC for this project, not required though. Leave as an empty string to disable.
+my $pipefile = "/tmp/ocr/streamparser.pipe";
+
+# ffmpeg loglevel
+my $loglevel = "info";
+
+# Should we use a socks proxy or not? (you can ignore this setting, just used for testing/debugging)
+my $socksproxy = 0;
+
+# twitch channel name of stream to parse
+my $twitch_streamer = "trumpsc";
+
+# local or remote video file to parse rather than a live twitch stream.
+# Examples: 
+#my $urlfile = "http://store72.media53.justin.tv/archives/2013-9-30/live_user_trumpsc_1380514954.flv";
+#my $urlfile = "/home/neon/movies/live_user_trumpsc_1380514954.flv";
+my $urlfile = '';
+
+my $ffmpeg_cmd;
+if ( $urlfile ) {
+    if ( $socksproxy ) {
+        $ffmpeg_cmd = "curl --silent --proxy socks5h://localhost:2323 -o - $urlfile | ffmpeg -i - -f image2pipe -vf fps=fps=$fps -loglevel $loglevel -vcodec mjpeg - | perl -pi -e 's/\\xFF\\xD8/JPEGIMGDELIM\\xFF\\xD8/ig'";
+    } else {
+        $ffmpeg_cmd = "curl --silent -o - $urlfile | ffmpeg -i - -f image2pipe -vf fps=fps=$fps -loglevel $loglevel -vcodec mjpeg - | perl -pi -e 's/\\xFF\\xD8/JPEGIMGDELIM\\xFF\\xD8/ig'";
+    }
+} elsif ( $twitch_streamer ) {
+    $ffmpeg_cmd = "livestreamer --ringbuffer-size 327680 --hds-fragment-buffer 10000 --hds-live-edge 1 --rtmpdump-proxy localhost:2323 -o - twitch.tv/$twitch_streamer Source | ffmpeg -i - -f image2pipe -vf fps=fps=$fps -loglevel $loglevel -vcodec mjpeg - | perl -pi -e 's/\\xFF\\xD8/JPEGIMGDELIM\\xFF\\xD8/ig'";
+} else {
+    die "You must specify either \$twitch_streamer or \$urlfile in the config section of this script";
+}
+
+open (CMD_PIPE, "$ffmpeg_cmd |");
+if ( defined $pipefile ) {
+    open(FIFO, "+>$pipefile") or die $!;
+}
+
+my $i = 0; # frame number we're currently processing
+my $jpgBuffer = ''; # last complete jpg image
+my $buffer = ''; # bytes read
+my %ocr;
+$ocr{'opponent_match_time'} = 0;
+$ocr{'player_match_time'} = 0;
+
+while (read(CMD_PIPE, $buffer, 2048)) {
+    # Doing the JPEGIMGDELIM stuff to actually increase performance (easier to replace \\xFF\\xD8 with JPEGIMGDELIM than to do a
+    # regex lookbehind match in here.)
+    my (@images) = split(/JPEGIMGDELIM/, $buffer);
+    shift(@images) if length $images[0] == 0;
+    if (scalar(@images) == 1) {
+        # Still the old image.
+        $jpgBuffer .= $images[0];
+    } elsif (scalar(@images) == 2) {
+        $i++;
+        # We've completed the old image.
+        $jpgBuffer .= shift(@images);
+        next if length $jpgBuffer == 0;
+
+        # Skip frames so we avoid detecting the same event several times. Somewhat 'ugly' solution, but it Just Works(tm) for now ^^
+        if ( exists $ocr{'skipframes'} and $ocr{'skipframes'} > 0 ) {
+#            say "Skipping frame: $i (skipframes left: $ocr{'skipframes'})";
+            $ocr{'skipframes'}--;
+            $jpgBuffer = shift(@images); # Why did I put this here?
+            next;
+        }
+
+        if ( analyzeimage( $jpgBuffer, 878, 626, 175, 65, $i, "outcome" ) =~ /(victory|defeat)/i ) {
+            $ocr{'outcome'} = lc $1;
+            say "At frame: $i(" . sprintf("%.2d:%.2d", int($i/$fps/60), $i/$fps%60) . ") - Game ended in: $ocr{'outcome'}";
+            print FIFO "MATCH_END $twitch_streamer $i $ocr{'outcome'}\n" if defined $pipefile;
+
+            $ocr{'opponent_match_time'} = 0;
+            $ocr{'player_match_time'} = 0;
+            $ocr{'skipframes'} = 12 * $fps;
+            undef $ocr{'opponentclass'};
+            undef $ocr{'playerclass'};
+        }
+
+        # Only scan for opponent and player class every second (or every 0.5 seconds)
+        if ( $i % $fps == 0 or $i % $fps == int($fps/2) ) {
+#        if ( $i % $fps == 0 ) {
+            if ( analyzeimage( $jpgBuffer, 1305, 532, 160, 26, $i, "opponent" ) =~ /(warrior|warlock|mage|druid|hunter|paladin|priest|shaman|rogue)/i ) {
+                $ocr{'opponentclass'} = lc $1;
+                $ocr{'opponent_match_time'} = $i;
+
+                say "At frame: $i(" . sprintf("%.2d:%.2d", int($i/$fps/60), $i/$fps%60) . ") - Opponent class: $ocr{'opponentclass'}";
+                print FIFO "MATCH_OPPONENT_CLASS $twitch_streamer $i $ocr{'opponentclass'}\n" if defined $pipefile;
+            }
+
+            if ( analyzeimage( $jpgBuffer, 570, 1046, 160, 26, $i, "player" ) =~ /(warrior|warlock|mage|druid|hunter|paladin|priest|shaman|rogue)/i ) {
+                $ocr{'playerclass'} = lc $1;
+                $ocr{'player_match_time'} = $i;
+
+                say "At frame: $i(" . sprintf("%.2d:%.2d", int($i/$fps/60), $i/$fps%60) . ") - Player class: $ocr{'playerclass'}";
+                print FIFO "MATCH_PLAYER_CLASS $twitch_streamer $i $ocr{'playerclass'}\n" if defined $pipefile;
+            }
+
+            if ( $ocr{'player_match_time'} and $ocr{'opponent_match_time'} ) {
+                $ocr{'opponent_match_time'} = 0;
+                $ocr{'player_match_time'} = 0;
+                $ocr{'skipframes'} = 4 * $fps;
+            }
+        }
+
+        # Checking that player/opponentclass is set here just for performance reasons, best would be not to have this check at all
+        if ( exists $ocr{'playerclass'} and exists $ocr{'opponentclass'} and analyzeimage( $jpgBuffer, 1198, 629, 272, 33, $i, "going" ) =~ /(you go first|you get an extra card)/i ) {
+        #if ( exists $ocr{'playerclass'} and exists $ocr{'opponentclass'} and analyzeimage( $jpgBuffer, 1280, 701, 272, 33, $i, "going" ) =~ /(you go first|you get an extra card)/i ) { # pre-patch location of this text
+            if ( $1 =~ /you go first/i ) {
+                $ocr{'starting'} = "first";
+            } elsif ( $1 =~ /you get an extra card/i ) {
+                $ocr{'starting'} = "second";
+            }
+            say "At frame: $i(" . sprintf("%.2d:%.2d", int($i/$fps/60), $i/$fps%60) . ") - Going: $ocr{'starting'}";
+            print FIFO "MATCH_GOING $twitch_streamer $i $ocr{'starting'}\n" if defined $pipefile;
+            $ocr{'skipframes'} = 6 * $fps;
+        }
+
+
+        # Start reading the next image.
+        $jpgBuffer = shift(@images);
+    } else {
+        die "Weird error: 3 items in array!\n";
+    }
+}
+
+# Sadly we can't pass an image variable blob to tesseract since we're just calling the tesseract binary with system() - next best thing is to save it
+# to a RAM drive
+sub analyzeimage {
+    my ($img,$x,$y,$box_x,$box_y,$i,$type) = @_;
+
+    my $im = Image::Magick->new(magick => 'jpg');
+    $im->BlobToImage($img);
+    $im->Crop(geometry=>"${box_x}x${box_y}+${x}+${y}");
+    $im->Write($img_out);
+    
+    if ( $type eq "going" ) {
+        my $im_cmd = "convert $img_out -fuzz 49% -fill black -opaque yellow $img_out";
+        system( $im_cmd );
+    }
+
+    my $text = tesseract($img_out);
+    #unlink $img_out; # remove the temporary file
+
+    return $text;
+}
+
+# This is quite ugly/hack'y, but there's no tesseract module for perl so we've got to use the C binary, CBA with perl inline C, this works well
+# enough.
+sub tesseract {
+    my ($abs_image, $type) = @_;
+   
+    # "hearthstone_classvictory" is the tesseract config to be used, for it to work reliably with hearthstone fonts this is necessary
+    my $cmd = "/usr/bin/tesseract $abs_image $abs_image hearthstone_classvictory 2>/dev/null";
+    system($cmd); # hard to check ==0 
+
+    open(FILE,'<', "$abs_image.txt") or die("can't open file for reading '$abs_image', $!");
+    local $/;
+    my $tess_output = <FILE>;
+    close FILE;
+
+    return $tess_output;
+}
